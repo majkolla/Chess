@@ -2,9 +2,7 @@ import random
 
 
 
-""" Optimera detta skit program, i wanna kill myself
-    If not optimize:
-        You're a worthless piece of shit    """
+
 
 piece_score = {"K": 0, "Q": 10, "R":5, "B": 3, "N": 3, "p":1}
 Checkmate = 1000
