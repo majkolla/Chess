@@ -14,8 +14,8 @@ images = {}
 ##                  loading image
 def load_images(): 
     pieces = ["wp", "wR", "wN", "wB", "wQ", "wK", "bp", "bR", "bN", "bB", "bQ", "bK"]
-    for piece in pieces: # C:\Users\micha\OneDrive\Desktop\mainKod\Python\chess\pieces
-        images[piece] = p.transform.scale(p.image.load(f'{piece}.png'), (size, size))  # Change absolute search to the pictures 
+    for piece in pieces: 
+        images[piece] = p.transform.scale(p.image.load(f'pieces\{piece}.png'), (size, size))  # Change absolute search to the pictures 
 
 #looping in all of the images and saving them. Also could be accessed by calling "image["xx"]"
  
