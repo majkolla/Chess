@@ -3,6 +3,7 @@
 This class will be responsible for staring all the information of the current state of a
 chess game, as well as determining the valid moves at the current state. 
 '''
+import numpy as np 
 
 class GameState():
     # 2d 8x8 list dimensional board, each element has 2 characters 
@@ -30,6 +31,27 @@ class GameState():
         self.current_Castling_rights = CastleingRights(True, True, True, True)
         self.castle_rightslog = [CastleingRights(self.current_Castling_rights.wks, self.current_Castling_rights.wqs, 
                                                 self.current_Castling_rights.bks, self.current_Castling_rights.bqs )]
+    def get_current_state(self): 
+        """ I want it to return a 3D tensor of the state       
+        
+        """
+
+
+        state_tensor = np.zeros((12, 8, 8), dtype=np.int8)
+
+        piece_encoder : dict =  {
+        "wp": 0, "wN": 1, "wB": 2, "wR": 3, "wQ": 4, "wK": 5,
+        "bp": 6, "bN": 7, "bB": 8, "bR": 9, "bQ": 10, "bK": 11
+    }
+        for r in range(8):
+            for c in range(8):
+                piece = self.board[r][c]
+                if piece != "--":
+                    channel = piece_encoder[piece]
+                    state_tensor[channel, r, c] = 1
+        side_to_move = np.full((1, 8, 8), 1 if self.white_to_move else 0, dtype=np.int8)
+        full_state_tensor = np.concatenate([state_tensor, side_to_move], axis=0)
+        return full_state_tensor
 
     def make_move(self, move):
         self.board[move.start_row][move.start_col] = "--"
