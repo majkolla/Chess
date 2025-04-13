@@ -359,6 +359,8 @@ class move():
             return self.moveID == other.moveID
         return False
 
+    def __hash__(self):
+        return hash(self.moveID)
         
     def get_rank_file(self, r, c):
         return self.cols_to_files[c] + self.rows_to_ranks[r]
