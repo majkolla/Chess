@@ -1,9 +1,6 @@
 import random
 
 
-
-
-
 piece_score = {"K": 0, "Q": 10, "R":5, "B": 3, "N": 3, "p":1}
 Checkmate = 1000
 Stalemate = 0
@@ -151,3 +148,12 @@ def score_material(board):
             elif square[0] == 'b':
                 score -= piece_score[square[1]]
     return score
+
+"""
+The new NN bot: 
+- first we convert the board into a tensor (function already added in Engine)
+- Run MCTS sims 
+- Choose best move from the search
+- Execute the move and update state
+
+"""

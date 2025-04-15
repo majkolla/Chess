@@ -208,7 +208,7 @@ def self_play(neural_net : NeuraNet, simulations):
     - run mcts to get move probs 
     - select a move 
     - save the state and move prob for trainging
-
+    
     """
     training : list = []
     state = Engine.GameState()
@@ -237,6 +237,14 @@ def self_play(neural_net : NeuraNet, simulations):
     outcome = mcts.get_outcome(state)
     training = [(s, p, outcome) for (s, p, _) in training]
     return training
+
+class ChessNet(): 
+    def __init__(self):
+        pass
+
+    def forward(self):
+        pass 
+    
 
 if __name__ == "__main__": 
     nn = NeuraNet()
