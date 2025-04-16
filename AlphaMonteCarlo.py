@@ -3,6 +3,11 @@ import random
 import Engine 
 import copy 
 import torch
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
 """
 Thought process: 
 
@@ -65,7 +70,16 @@ class NeuraNet:
         
         pass 
 
+    def save_model(self, file_path):
+        # Save the model's state dictionary
+        torch.save(self.model.state_dict(), file_path)
+        print("Model saved to", file_path)
 
+    def load_model(self, file_path):
+        # Load the model's state dictionary
+        self.model.load_state_dict(torch.load(file_path))
+        self.model.eval()  # Set the model to evaluation mode
+        print("Model loaded from", file_path)
 
 class MCTSNode: 
     """
@@ -238,13 +252,24 @@ def self_play(neural_net : NeuraNet, simulations):
     training = [(s, p, outcome) for (s, p, _) in training]
     return training
 
-class ChessNet(): 
-    def __init__(self):
-        pass
 
-    def forward(self):
-        pass 
+class ChessNet(nn.Module):
+    def __init__(self):
+        super(ChessNet, self).__init__()
+        # Example architecture: a simple conv + fc network.
+        # Input channels: 13 (e.g., 12 channels for pieces + 1 for side-to-move)
+        self.conv = nn.Conv2d(in_channels=13, out_channels=64, kernel_size=3, padding=1)
+        self.fc_policy = nn.Linear(64 * 8 * 8, 4672) 
+        self.fc_value = nn.Linear(64 * 8 * 8, 1)
     
+    def forward(self, x):
+        # x is expected to have shape [batch_size, 13, 8, 8]
+        x = F.relu(self.conv(x))
+        x = x.view(x.size(0), -1)
+        policy_logits = self.fc_policy(x)
+        value = torch.tanh(self.fc_value(x))
+        return policy_logits, value
+
 
 if __name__ == "__main__": 
     nn = NeuraNet()
@@ -254,3 +279,5 @@ if __name__ == "__main__":
     
     print("Generated {} training samples.".format(len(training_data)))
     nn.train(training_data)
+
+    nn.save_model("chess_model.pth")
