@@ -1,4 +1,4 @@
-import numpy 
+import numpy as np
 import random 
 import Engine 
 import copy 
@@ -39,181 +39,185 @@ board (the game state)
 
 """
 
+
+def move_to_index(mv: Engine.move) -> int:
+    return ((mv.start_row * 8 + mv.start_col) * 64) + (mv.end_row * 8 + mv.end_col)
+
+def index_to_move(idx: int, state: Engine.GameState) -> Engine.move | None:
+    """Return the move object matching index or None if it is illegal in the given state"""
+    sr, sc = divmod(idx // 64, 8)
+    er, ec = divmod(idx % 64, 8)
+    template = Engine.move((sr, sc), (er, ec), state.board)
+    for mv in state.get_all_valid_moves():
+        if mv == template:
+            return mv
+    return None
+
+
+
+# ────────────────────────────────────────────────────────────────────────────────
 class NeuraNet:
-    """
-    
-    """
-    def __init__(self): 
-        pass 
+    def __init__(self, device: str | None = None):
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.model  = ChessNet().to(self.device)
+        self.opt    = torch.optim.Adam(self.model.parameters(), lr=1e-3)
+        self.kl = nn.KLDivLoss(reduction="batchmean")
+        self.mse = nn.MSELoss()
 
-    def predict(self, state : Engine.GameState): 
-        """
-        We represent the board as a 2D tensor (matrix): 
-        we return policy, value as a tuplem 
-        """
-        moves = state.get_all_valid_moves()
-        if moves: 
-            prob = 1.0 / len(moves)
-            policy = {move: prob for move in moves}
-        else: 
-            policy = {}
-        value = random.uniform(-1,1)
-        return policy, value 
+    @torch.no_grad()
+    def predict(self, state: Engine.GameState) -> tuple[dict[Engine.move, float], float]:
+        board = torch.tensor(state.get_current_state(), dtype=torch.float32, device=self.device).unsqueeze(0)
+        logits, value = self.model(board)
+        probs = torch.softmax(logits, dim=1).squeeze(0).cpu().numpy()
 
-    def train(self, training_data): 
-        """ 
-        Here we want to train the neural network on the training data
-        Im thinking: training_data = (state :  state_tensor, move_probabilities, gam_outcome)
+        legal_moves = state.get_all_valid_moves()
+        if not legal_moves:
+            return {}, 0.0
 
-        """
-        # we implemet the training loop maybe by backpropagation or something. 
-        
-        pass 
+        move_probs: dict[Engine.move, float] = {}
+        total = 0.0
+        for mv in legal_moves:
+            p = probs[move_to_index(mv)]
+            move_probs[mv] = p
+            total += p
+        if total == 0:
+            move_probs = {m: 1/len(legal_moves) for m in legal_moves}
+        else:
+            move_probs = {m: p/total for m, p in move_probs.items()}
+        return move_probs, float(value.item())
 
-    def save_model(self, file_path):
-        # Save the model's state dictionary
-        torch.save(self.model.state_dict(), file_path)
-        print("Model saved to", file_path)
+    def train(self, samples: list[tuple[np.ndarray, dict[Engine.move, float], int]],
+              epochs: int = 5, batch_size: int = 32):
+        NUM_MOVES = 8**4
+        if not samples:
+            return
+        boards , policies , values = [], [], []
+        for b, pi, v in samples:
+            boards.append(torch.tensor(b, dtype=torch.float32))
+            vec = np.zeros(NUM_MOVES, dtype=np.float32)
+            for mv, p in pi.items():
+                vec[move_to_index(mv)] = p
+            policies.append(torch.tensor(vec, dtype=torch.float32))
+            values.append(float(v))
+        boards   = torch.stack(boards).to(self.device)
+        policies = torch.stack(policies).to(self.device)
+        values   = torch.tensor(values, dtype=torch.float32).to(self.device)
 
-    def load_model(self, file_path):
-        # Load the model's state dictionary
-        self.model.load_state_dict(torch.load(file_path))
-        self.model.eval()  # Set the model to evaluation mode
-        print("Model loaded from", file_path)
+        for epoch in range(epochs):
+            perm = torch.randperm(len(samples), device=self.device)
+            boards, policies, values = boards[perm], policies[perm], values[perm]
+            for start in range(0, len(samples), batch_size):
+                end = start + batch_size
+                xb, pb, vb = boards[start:end], policies[start:end], values[start:end]
+                self.opt.zero_grad()
+                logits, v_pred = self.model(xb)
+                loss_p = self.kl(F.log_softmax(logits, dim=1), pb)
+                loss_v = self.mse(v_pred, vb)
+                (loss_p + loss_v).backward()
+                self.opt.step()
+
+    def save_model(self, path: str):
+        torch.save(self.model.state_dict(), path)
+
+    def load_model(self, path: str):
+        self.model.load_state_dict(torch.load(path, map_location=self.device))
+        self.model.eval()
 
 class MCTSNode: 
+    __slots__ = ("state", "parent", "children", "visit_count", "total_value", "prior", "move")
+    
     """
     Monte carlo tree search data structure
 
     The point here is that each node representrs a game state
     
     """
-    def __init__(self, state, parent=None):
-        self.state = state         # Instance of the gamestate
-        self.parent = parent       # Parent MCTSNode
-        self.children = {}         # Dictionary: move -> child node
+    def __init__(self, state: Engine.GameState, parent: 'MCTSNode|None' = None,
+                 prior: float = 0.0, move: Engine.move | None = None):
+        self.state = state
+        self.parent = parent
+        self.children: dict[Engine.move, MCTSNode] = {}
         self.visit_count = 0
-        self.total_value = 0
-        self.prior = 0  
+        self.total_value = 0.0
+        self.prior = prior
+        self.move = move
+    def q(self):
+        return self.total_value / self.visit_count if self.visit_count else 0.0
+    def is_leaf(self):
+        return not self.children
 
-    def is_leaf(self) -> bool: 
-        return len(self.children) == 0
 
 
-class MCTS: 
-    """
-    Monte carlo tree search implementation
-    """
-    def __init__(self, neural_net, simulations,):
-        self.neural_net = neural_net
-        self.simulations = simulations
+class MCTS:
+    def __init__(self, nn: NeuraNet, simulations: int = 200, c_puct: float = 1.4):
+        self.nn = nn
+        self.N = simulations
+        self.c = c_puct
 
-    def get_next_state(self, state : Engine.GameState , move):
-        new_state = copy.deepcopy(state)
-        new_state.make_move(move)
-        return new_state
+    def search(self, root_state: Engine.GameState) -> dict[Engine.move, float]:
+        root = MCTSNode(root_state)
+        # Expand root once
+        policy, _ = self.nn.predict(root_state)
+        for mv, p in policy.items():
+            root.children[mv] = MCTSNode(self._next_state(root_state, mv), parent=root, prior=p, move=mv)
 
-    def search(self, state): 
-        """
-        Perform MCTS starting from the state
-        we return a map of moves to prob 
-        """
-        root = MCTSNode(state)
+        for _ in range(self.N):
+            leaf = self._select(root)
+            value = self._expand_and_eval(leaf)
+            self._backprop(leaf, value)
 
-        for _ in range(self.simulations):
-            self.simulate(root)
+        visits = np.array([ch.visit_count for ch in root.children.values()], dtype=np.float32)
+        if visits.sum() == 0:
+            return {}
+        probs = visits / visits.sum()
+        return dict(zip(root.children.keys(), probs))
 
-        # After all simulations, compute move probabilities from visit counts.
-        move_visits = {move: child.visit_count for move, child in root.children.items()}
-        total_visits = sum(move_visits.values())
-        if total_visits > 0:
-            move_probs = {move: count / total_visits for move, count in move_visits.items()}
-        else:
-            move_probs = {}
-        return move_probs
-    
-    def simulate(self, node): 
-        """
-        Here we run one sim starting from a node 
-        """
-        outcome = self.get_outcome(node.state)
-        if outcome is not None:
-            # Terminal state reached: return outcome
-            return outcome
+    def _select(self, node: MCTSNode) -> MCTSNode:
+        while not node.is_leaf():
+            best, best_score = None, -1e9
+            sqrt_visits = np.sqrt(node.visit_count)
+            for ch in node.children.values():
+                u = self.c * ch.prior * sqrt_visits / (1 + ch.visit_count)
+                score = ch.q() + u
+                if score > best_score:
+                    best, best_score = ch, score
+            node = best
+        return node
 
-        if node.is_leaf():
-            # Expand leaf: use neural network to obtain move probabilities and value
-            policy, value = self.neural_net.predict(node.state)
-            # Expand children nodes based on the policy
-            for move, p in policy.items():
-                next_state = self.get_next_state(node.state, move)
-                child_node = MCTSNode(next_state, parent=node)
-                child_node.prior = p
-                node.children[move] = child_node
-            return value
-        else:
-            # Select the child with the highest UCB score and simulate down from it
-            best_child = self.select_child(node)
-            value = self.simulate(best_child)
-            self.backpropagate(best_child, value)
-            return value
-        
+    def _expand_and_eval(self, node: MCTSNode) -> float:
+        term = self._terminal_value(node.state)
+        if term is not None:
+            return term
+        policy, value = self.nn.predict(node.state)
+        for mv, p in policy.items():
+            node.children[mv] = MCTSNode(self._next_state(node.state, mv), parent=node, prior=p, move=mv)
+        return value
 
-    def select_child(self, node): 
-        """
-        we select child based of the UCB formula: 
-        score = Q / (N) + c_puct * prior * sqrt(parent_visits) / (1 + N)
-        Q - total value of the node 
-        N - visit count of the node
-        """
-
-        c_puct = 1.0
-        best_score = -float("inf")
-        best_child = None
-        
-        for move, child in node.children.items():
-            if child.visit_count == 0:
-                ucb = c_puct * child.prior * (node.visit_count ** 0.5)
-            else:
-                ucb = (child.total_value / child.visit_count +
-                       c_puct * child.prior * (node.visit_count ** 0.5) / (1 + child.visit_count))
-            if ucb > best_score:
-                best_score = ucb
-                best_child = child
-        return best_child
-    
-
-    def backpropagate(self, node, value): 
-        """
-        Here we propagate the sim value up the tree
-
-        the alt the sign for each move so it becomes correct with the turns and stuff!
-        """
-        while node is not None: 
+    def _backprop(self, node: MCTSNode, value: float):
+        while node:
             node.visit_count += 1
             node.total_value += value
-            value = -value  # Switch perspective for the opponent
+            value = -value
             node = node.parent
 
+    @staticmethod
+    def _next_state(state: Engine.GameState, mv: Engine.move) -> Engine.GameState:
+        nxt = copy.deepcopy(state)
+        nxt.make_move(mv)
+        return nxt
 
-    def get_outcome(self, state : Engine.GameState): 
-        """ 
-        Encoding: 
-        1 if white won 
-        -1 if black won 
-        0 if draw 
-        """
-        if state.check_mate: 
-            if state.white_to_move: 
-                return -1
-            else: 
-                return 1 
-        elif state.stale_mate: 
-            return 0 
-        return None #Game not over! python is so nice we aint need no encoding for that lol
+    @staticmethod
+    def _terminal_value(state: Engine.GameState):
+        if state.check_mate:
+            return 1 if not state.white_to_move else -1
+        if state.stale_mate:
+            return 0
+        return None
+
+
+ 
+def self_play(nn: NeuraNet, sims: int = 200) -> list[tuple[np.ndarray, dict[Engine.move, float], int]]:
     
-
-def self_play(neural_net : NeuraNet, simulations): 
     """
     play a game by using the self play with MCTS moves. 
     Each MCTS output (state, move prob) is saved for the training
@@ -224,60 +228,48 @@ def self_play(neural_net : NeuraNet, simulations):
     - save the state and move prob for trainging
     
     """
-    training : list = []
-    state = Engine.GameState()
-    mcts = MCTS(neural_net, simulations)
-
-    # While game not over (assuming check_mate and stale_mate are flags in the state)
-    while not state.check_mate and not state.stale_mate:
-        # Run MCTS to determine move probabilities for current state
-        move_probs = mcts.search(state)
-        if not move_probs:
-            # No moves available; break out of the loop
+    game = Engine.GameState()
+    mcts = MCTS(nn, sims)
+    history = []
+    while not (game.check_mate or game.stale_mate):
+        probs = mcts.search(game)
+        if not probs:
             break
-        
-        # Choose a move – here we use a weighted choice based on move probabilities.
-        moves = list(move_probs.keys())
-        probs = list(move_probs.values())
-        chosen_move = random.choices(moves, weights=probs, k=1)[0]
-        
-        # Save current state representation and move probs.
-        training.append((state.get_current_state(), move_probs, None))
-        
-        # Make the move
-        state.make_move(chosen_move)
-
-    # Now the game is over and we assign the game outcome to each training example 
-    outcome = mcts.get_outcome(state)
-    training = [(s, p, outcome) for (s, p, _) in training]
-    return training
+        history.append((game.get_current_state(), probs, None))
+        mv = random.choices(list(probs.keys()), weights=list(probs.values()), k=1)[0]
+        game.make_move(mv)
+    outcome = 0
+    if game.check_mate:
+        outcome = 1 if not game.white_to_move else -1
+    return [(b, p, outcome) for (b, p, _) in history]
 
 
 class ChessNet(nn.Module):
     def __init__(self):
-        super(ChessNet, self).__init__()
-        # Example architecture: a simple conv + fc network.
-        # Input channels: 13 (e.g., 12 channels for pieces + 1 for side-to-move)
-        self.conv = nn.Conv2d(in_channels=13, out_channels=64, kernel_size=3, padding=1)
-        self.fc_policy = nn.Linear(64 * 8 * 8, 4672) 
-        self.fc_value = nn.Linear(64 * 8 * 8, 1)
-    
-    def forward(self, x):
-        # x is expected to have shape [batch_size, 13, 8, 8]
-        x = F.relu(self.conv(x))
-        x = x.view(x.size(0), -1)
-        policy_logits = self.fc_policy(x)
-        value = torch.tanh(self.fc_value(x))
-        return policy_logits, value
+        super().__init__()
+        self.conv1 = nn.Conv2d(13, 128, 3, padding=1)
+        self.bn1   = nn.BatchNorm2d(128)
+        self.conv2 = nn.Conv2d(128, 256, 3, padding=1)
+        self.bn2   = nn.BatchNorm2d(256)
+        self.conv3 = nn.Conv2d(256, 256, 3, padding=1)
+        self.bn3   = nn.BatchNorm2d(256)
+        self.flat  = nn.Flatten()
+        self.fc    = nn.Linear(256 * 8 * 8, 1024)
+        self.policy_head = nn.Linear(1024, 8**4)
+        self.value_head  = nn.Linear(1024, 1)
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = F.relu(self.bn2(self.conv2(x)))
+        x = F.relu(self.bn3(self.conv3(x)))
+        x = self.flat(x)
+        x = F.relu(self.fc(x))
+        return self.policy_head(x), torch.tanh(self.value_head(x)).squeeze(1)
 
 
 if __name__ == "__main__": 
-    nn = NeuraNet()
-
-    sims = 50
-    training_data = self_play(nn, sims) 
-    
-    print("Generated {} training samples.".format(len(training_data)))
-    nn.train(training_data)
-
-    nn.save_model("chess_model.pth")
+    net = NeuraNet()
+    samples = self_play(net, sims=30)
+    print(f"Self‑play generated {len(samples)} positions → training…")
+    net.train(samples, epochs=1)
+    net.save_model("chess_model.pth")
