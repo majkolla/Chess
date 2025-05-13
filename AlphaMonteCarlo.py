@@ -6,6 +6,7 @@ import torch
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Dict, List, Tuple, Optional
 
 
 """
@@ -40,44 +41,128 @@ board (the game state)
 """
 
 
+# AlphaMC_complete_with_policy.py
+# Augmented with a **heuristic policy network** to avoid purely random play in
+# the very first self‑play games.  The small net is cheap to evaluate and gives
+# MCTS a sensible prior before the big CNN has learned anything.
+
+from __future__ import annotations
+
+import copy
+import random
+from typing import Dict, List, Tuple, Optional
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+import Engine
+
+NUM_MOVES = 8 ** 4  
+
 def move_to_index(mv: Engine.move) -> int:
     return ((mv.start_row * 8 + mv.start_col) * 64) + (mv.end_row * 8 + mv.end_col)
 
-def index_to_move(idx: int, state: Engine.GameState) -> Engine.move | None:
-    """Return the move object matching index or None if it is illegal in the given state"""
-    sr, sc = divmod(idx // 64, 8)
-    er, ec = divmod(idx % 64, 8)
-    template = Engine.move((sr, sc), (er, ec), state.board)
-    for mv in state.get_all_valid_moves():
-        if mv == template:
-            return mv
-    return None
+#   HeuristicPolicy – 
+class HeuristicPolicy:
+    """first test implementation of a rule based scorer, the probability distribution over legal moves.
+    """
 
+    _piece_value = {"p": 1, "N": 3, "B": 3, "R": 5, "Q": 9, "K": 0}
+    _centre = {(3, 3), (3, 4), (4, 3), (4, 4)}
 
+    def _material_score(self, board):
+        s = 0
+        for r in range(8):
+            for c in range(8):
+                piece = board[r][c]
+                if piece != "--":
+                    val = self._piece_value[piece[1]]
+                    s += val if piece[0] == "w" else -val
+        return s
 
-# ────────────────────────────────────────────────────────────────────────────────
+    def predict(self, state: Engine.GameState) -> Dict[Engine.move, float]:
+        moves = state.get_all_valid_moves()
+        if not moves:
+            return {}
+
+        base_score = self._material_score(state.board)
+        scores: List[float] = []
+        for mv in moves:
+            next_state = copy.deepcopy(state)
+            next_state.make_move(mv)
+            sc = self._material_score(next_state.board) - base_score
+            # bonuses
+            if mv.is_pawn_promotion:
+                sc += 0.9
+            if (mv.end_row, mv.end_col) in self._centre:
+                sc += 0.1
+            scores.append(sc)
+
+        # Convert to positive logits
+        scores_np = np.array(scores, dtype=np.float32)
+        min_s = scores_np.min()
+        scores_np -= min_s  # shift
+        if scores_np.sum() == 0:
+            probs = np.full_like(scores_np, 1 / len(moves))
+        else:
+            probs = scores_np / scores_np.sum()
+        return dict(zip(moves, probs.tolist()))
+
+#   CNN (policy + value) 
+class ChessNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv1 = nn.Conv2d(13, 128, 3, padding=1)
+        self.bn1   = nn.BatchNorm2d(128)
+        self.conv2 = nn.Conv2d(128, 256, 3, padding=1)
+        self.bn2   = nn.BatchNorm2d(256)
+        self.conv3 = nn.Conv2d(256, 256, 3, padding=1)
+        self.bn3   = nn.BatchNorm2d(256)
+        self.flat  = nn.Flatten()
+        self.fc    = nn.Linear(256 * 8 * 8, 1024)
+        self.policy_head = nn.Linear(1024, NUM_MOVES)
+        self.value_head  = nn.Linear(1024, 1)
+
+    def forward(self, x):
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = F.relu(self.bn2(self.conv2(x)))
+        x = F.relu(self.bn3(self.conv3(x)))
+        x = self.flat(x)
+        x = F.relu(self.fc(x))
+        return self.policy_head(x), torch.tanh(self.value_head(x)).squeeze(1)
+
 class NeuraNet:
-    def __init__(self, device: str | None = None):
+    def __init__(self, device: str | None = None, beta: float = 0.7):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.model  = ChessNet().to(self.device)
         self.opt    = torch.optim.Adam(self.model.parameters(), lr=1e-3)
         self.kl = nn.KLDivLoss(reduction="batchmean")
         self.mse = nn.MSELoss()
+        self.hp = HeuristicPolicy()
+        self.beta = beta  # weight for blending heuristic policy (0..1)
 
+    # inference
     @torch.no_grad()
-    def predict(self, state: Engine.GameState) -> tuple[dict[Engine.move, float], float]:
+    def predict(self, state: Engine.GameState) -> Tuple[Dict[Engine.move, float], float]:
         board = torch.tensor(state.get_current_state(), dtype=torch.float32, device=self.device).unsqueeze(0)
-        logits, value = self.model(board)
-        probs = torch.softmax(logits, dim=1).squeeze(0).cpu().numpy()
+        logits_cnn, value = self.model(board)
+        probs_cnn = torch.softmax(logits_cnn, dim=1).squeeze(0).cpu().numpy()
 
         legal_moves = state.get_all_valid_moves()
         if not legal_moves:
             return {}, 0.0
 
-        move_probs: dict[Engine.move, float] = {}
+        # Heuristic prior
+        probs_heur = self.hp.predict(state)
+
+        move_probs: Dict[Engine.move, float] = {}
         total = 0.0
         for mv in legal_moves:
-            p = probs[move_to_index(mv)]
+            p_cnn  = probs_cnn[move_to_index(mv)]
+            p_heur = probs_heur.get(mv, 0.0)
+            p = (1 - self.beta) * p_cnn + self.beta * p_heur
             move_probs[mv] = p
             total += p
         if total == 0:
@@ -86,29 +171,28 @@ class NeuraNet:
             move_probs = {m: p/total for m, p in move_probs.items()}
         return move_probs, float(value.item())
 
-    def train(self, samples: list[tuple[np.ndarray, dict[Engine.move, float], int]],
+    # training 
+    def train(self, samples: List[Tuple[np.ndarray, Dict[Engine.move, float], int]],
               epochs: int = 5, batch_size: int = 32):
-        NUM_MOVES = 8**4
         if not samples:
             return
-        boards , policies , values = [], [], []
-        for b, pi, v in samples:
-            boards.append(torch.tensor(b, dtype=torch.float32))
+        X , P , V = [], [], []
+        for board, pi, outcome in samples:
+            X.append(torch.tensor(board, dtype=torch.float32))
             vec = np.zeros(NUM_MOVES, dtype=np.float32)
             for mv, p in pi.items():
                 vec[move_to_index(mv)] = p
-            policies.append(torch.tensor(vec, dtype=torch.float32))
-            values.append(float(v))
-        boards   = torch.stack(boards).to(self.device)
-        policies = torch.stack(policies).to(self.device)
-        values   = torch.tensor(values, dtype=torch.float32).to(self.device)
+            P.append(torch.tensor(vec, dtype=torch.float32))
+            V.append(float(outcome))
+        X = torch.stack(X).to(self.device)
+        P = torch.stack(P).to(self.device)
+        V = torch.tensor(V, dtype=torch.float32).to(self.device)
 
-        for epoch in range(epochs):
+        for _ in range(epochs):
             perm = torch.randperm(len(samples), device=self.device)
-            boards, policies, values = boards[perm], policies[perm], values[perm]
-            for start in range(0, len(samples), batch_size):
-                end = start + batch_size
-                xb, pb, vb = boards[start:end], policies[start:end], values[start:end]
+            X, P, V = X[perm], P[perm], V[perm]
+            for i in range(0, len(samples), batch_size):
+                xb, pb, vb = X[i:i+batch_size], P[i:i+batch_size], V[i:i+batch_size]
                 self.opt.zero_grad()
                 logits, v_pred = self.model(xb)
                 loss_p = self.kl(F.log_softmax(logits, dim=1), pb)
@@ -116,6 +200,7 @@ class NeuraNet:
                 (loss_p + loss_v).backward()
                 self.opt.step()
 
+    # persistence 
     def save_model(self, path: str):
         torch.save(self.model.state_dict(), path)
 
@@ -123,20 +208,14 @@ class NeuraNet:
         self.model.load_state_dict(torch.load(path, map_location=self.device))
         self.model.eval()
 
-class MCTSNode: 
+# ────────────────────────────────────────────────────────────────────────────────
+class MCTSNode:
     __slots__ = ("state", "parent", "children", "visit_count", "total_value", "prior", "move")
-    
-    """
-    Monte carlo tree search data structure
-
-    The point here is that each node representrs a game state
-    
-    """
-    def __init__(self, state: Engine.GameState, parent: 'MCTSNode|None' = None,
-                 prior: float = 0.0, move: Engine.move | None = None):
+    def __init__(self, state: Engine.GameState, parent: Optional['MCTSNode'] = None,
+                 prior: float = 0.0, move: Optional[Engine.move] = None):
         self.state = state
         self.parent = parent
-        self.children: dict[Engine.move, MCTSNode] = {}
+        self.children: Dict[Engine.move, 'MCTSNode'] = {}
         self.visit_count = 0
         self.total_value = 0.0
         self.prior = prior
@@ -146,19 +225,17 @@ class MCTSNode:
     def is_leaf(self):
         return not self.children
 
-
-
 class MCTS:
     def __init__(self, nn: NeuraNet, simulations: int = 200, c_puct: float = 1.4):
         self.nn = nn
         self.N = simulations
         self.c = c_puct
 
-    def search(self, root_state: Engine.GameState) -> dict[Engine.move, float]:
+    def search(self, root_state: Engine.GameState) -> Dict[Engine.move, float]:
         root = MCTSNode(root_state)
-        # Expand root once
-        policy, _ = self.nn.predict(root_state)
-        for mv, p in policy.items():
+        # first expansion uses blended priors from nn.predict
+        priors, _ = self.nn.predict(root_state)
+        for mv, p in priors.items():
             root.children[mv] = MCTSNode(self._next_state(root_state, mv), parent=root, prior=p, move=mv)
 
         for _ in range(self.N):
@@ -188,8 +265,8 @@ class MCTS:
         term = self._terminal_value(node.state)
         if term is not None:
             return term
-        policy, value = self.nn.predict(node.state)
-        for mv, p in policy.items():
+        priors, value = self.nn.predict(node.state)
+        for mv, p in priors.items():
             node.children[mv] = MCTSNode(self._next_state(node.state, mv), parent=node, prior=p, move=mv)
         return value
 
@@ -201,7 +278,7 @@ class MCTS:
             node = node.parent
 
     @staticmethod
-    def _next_state(state: Engine.GameState, mv: Engine.move) -> Engine.GameState:
+    def _next_state(state: Engine.GameState, mv: Engine.move):
         nxt = copy.deepcopy(state)
         nxt.make_move(mv)
         return nxt
@@ -214,64 +291,28 @@ class MCTS:
             return 0
         return None
 
+# ────────────────────────────────────────────────────────────────────────────────
 
- 
-def self_play(nn: NeuraNet, sims: int = 200) -> list[tuple[np.ndarray, dict[Engine.move, float], int]]:
-    
-    """
-    play a game by using the self play with MCTS moves. 
-    Each MCTS output (state, move prob) is saved for the training
-
-    alg: 
-    - run mcts to get move probs 
-    - select a move 
-    - save the state and move prob for trainging
-    
-    """
+def self_play(nn: NeuraNet, sims: int = 300) -> List[Tuple[np.ndarray, Dict[Engine.move, float], int]]:
     game = Engine.GameState()
-    mcts = MCTS(nn, sims)
+    mcts = MCTS(nn, simulations=sims)
     history = []
     while not (game.check_mate or game.stale_mate):
         probs = mcts.search(game)
         if not probs:
             break
         history.append((game.get_current_state(), probs, None))
-        mv = random.choices(list(probs.keys()), weights=list(probs.values()), k=1)[0]
+        mv = max(probs.items(), key=lambda kv: kv[1])[0]  # pick best move (no randomness)
         game.make_move(mv)
     outcome = 0
     if game.check_mate:
         outcome = 1 if not game.white_to_move else -1
     return [(b, p, outcome) for (b, p, _) in history]
 
-
-class ChessNet(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.conv1 = nn.Conv2d(13, 128, 3, padding=1)
-        self.bn1   = nn.BatchNorm2d(128)
-        self.conv2 = nn.Conv2d(128, 256, 3, padding=1)
-        self.bn2   = nn.BatchNorm2d(256)
-        self.conv3 = nn.Conv2d(256, 256, 3, padding=1)
-        self.bn3   = nn.BatchNorm2d(256)
-        self.flat  = nn.Flatten()
-        self.fc    = nn.Linear(256 * 8 * 8, 1024)
-        self.policy_head = nn.Linear(1024, 8**4)
-        self.value_head  = nn.Linear(1024, 1)
-
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        x = F.relu(self.bn1(self.conv1(x)))
-        x = F.relu(self.bn2(self.conv2(x)))
-        x = F.relu(self.bn3(self.conv3(x)))
-        x = self.flat(x)
-        x = F.relu(self.fc(x))
-        return self.policy_head(x), torch.tanh(self.value_head(x)).squeeze(1)
-
-class PolicyNN(nn.Module): 
-    pass 
-
-if __name__ == "__main__": 
+# ────────────────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
     net = NeuraNet()
-    samples = self_play(net, sims=30)
-    print(f"Self‑play generated {len(samples)} positions → training…")
-    net.train(samples, epochs=1)
+    positions = self_play(net, sims=60)
+    print(f"Generated {len(positions)} positions → training 1 epoch…")
+    net.train(positions, epochs=1)
     net.save_model("chess_model.pth")
