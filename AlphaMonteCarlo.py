@@ -266,6 +266,8 @@ class ChessNet(nn.Module):
         x = F.relu(self.fc(x))
         return self.policy_head(x), torch.tanh(self.value_head(x)).squeeze(1)
 
+class PolicyNN(nn.Module): 
+    pass 
 
 if __name__ == "__main__": 
     net = NeuraNet()
