@@ -41,77 +41,32 @@ board (the game state)
 """
 
 
-# AlphaMC_complete_with_policy.py
-# Augmented with a **heuristic policy network** to avoid purely random play in
-# the very first self‑play games.  The small net is cheap to evaluate and gives
-# MCTS a sensible prior before the big CNN has learned anything.
+NUM_MOVES = 8 ** 4  # 4 096 from–to square pairs
 
-from __future__ import annotations
-
-import copy
-import random
-from typing import Dict, List, Tuple, Optional
-
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-import Engine
-
-NUM_MOVES = 8 ** 4  
+#   Move <‑‑> index helpers
 
 def move_to_index(mv: Engine.move) -> int:
     return ((mv.start_row * 8 + mv.start_col) * 64) + (mv.end_row * 8 + mv.end_col)
 
-#   HeuristicPolicy – 
-class HeuristicPolicy:
-    """first test implementation of a rule based scorer, the probability distribution over legal moves.
-    """
+class PolicyNetSmall(nn.Module):
+    """~150 K parameters. Fast enough for use at every tree node."""
+    def __init__(self):
+        super().__init__()
+        self.conv1 = nn.Conv2d(13, 32, 3, padding=1)
+        self.conv2 = nn.Conv2d(32, 64, 3, padding=1)
+        self.conv3 = nn.Conv2d(64, 64, 3, padding=1)
+        self.flat  = nn.Flatten()
+        self.fc    = nn.Linear(64 * 8 * 8, NUM_MOVES)
 
-    _piece_value = {"p": 1, "N": 3, "B": 3, "R": 5, "Q": 9, "K": 0}
-    _centre = {(3, 3), (3, 4), (4, 3), (4, 4)}
+    def forward(self, x):
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
+        x = F.relu(self.conv3(x))
+        x = self.flat(x)
+        return self.fc(x)  # raw logits
 
-    def _material_score(self, board):
-        s = 0
-        for r in range(8):
-            for c in range(8):
-                piece = board[r][c]
-                if piece != "--":
-                    val = self._piece_value[piece[1]]
-                    s += val if piece[0] == "w" else -val
-        return s
-
-    def predict(self, state: Engine.GameState) -> Dict[Engine.move, float]:
-        moves = state.get_all_valid_moves()
-        if not moves:
-            return {}
-
-        base_score = self._material_score(state.board)
-        scores: List[float] = []
-        for mv in moves:
-            next_state = copy.deepcopy(state)
-            next_state.make_move(mv)
-            sc = self._material_score(next_state.board) - base_score
-            # bonuses
-            if mv.is_pawn_promotion:
-                sc += 0.9
-            if (mv.end_row, mv.end_col) in self._centre:
-                sc += 0.1
-            scores.append(sc)
-
-        # Convert to positive logits
-        scores_np = np.array(scores, dtype=np.float32)
-        min_s = scores_np.min()
-        scores_np -= min_s  # shift
-        if scores_np.sum() == 0:
-            probs = np.full_like(scores_np, 1 / len(moves))
-        else:
-            probs = scores_np / scores_np.sum()
-        return dict(zip(moves, probs.tolist()))
-
-#   CNN (policy + value) 
-class ChessNet(nn.Module):
+class ValueNet(nn.Module):
+    """Deeper network (~2 M params) used only at leaf nodes → slower but OK."""
     def __init__(self):
         super().__init__()
         self.conv1 = nn.Conv2d(13, 128, 3, padding=1)
@@ -121,9 +76,8 @@ class ChessNet(nn.Module):
         self.conv3 = nn.Conv2d(256, 256, 3, padding=1)
         self.bn3   = nn.BatchNorm2d(256)
         self.flat  = nn.Flatten()
-        self.fc    = nn.Linear(256 * 8 * 8, 1024)
-        self.policy_head = nn.Linear(1024, NUM_MOVES)
-        self.value_head  = nn.Linear(1024, 1)
+        self.fc    = nn.Linear(256 * 8 * 8, 512)
+        self.val   = nn.Linear(512, 1)
 
     def forward(self, x):
         x = F.relu(self.bn1(self.conv1(x)))
@@ -131,53 +85,48 @@ class ChessNet(nn.Module):
         x = F.relu(self.bn3(self.conv3(x)))
         x = self.flat(x)
         x = F.relu(self.fc(x))
-        return self.policy_head(x), torch.tanh(self.value_head(x)).squeeze(1)
+        return torch.tanh(self.val(x)).squeeze(1)
 
-class NeuraNet:
-    def __init__(self, device: str | None = None, beta: float = 0.7):
+# ────────────────────────────────────────────────────────────────────────────────
+class DualNet:
+    """Handles inference & joint training for PolicyNetSmall + ValueNet."""
+    def __init__(self, device: str | None = None):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.model  = ChessNet().to(self.device)
-        self.opt    = torch.optim.Adam(self.model.parameters(), lr=1e-3)
-        self.kl = nn.KLDivLoss(reduction="batchmean")
+        self.policy = PolicyNetSmall().to(self.device)
+        self.value  = ValueNet().to(self.device)
+        # one optimiser for both parameter sets keeps it simple
+        self.opt = torch.optim.Adam(list(self.policy.parameters()) + list(self.value.parameters()), lr=1e-3)
+        self.kl  = nn.KLDivLoss(reduction="batchmean")
         self.mse = nn.MSELoss()
-        self.hp = HeuristicPolicy()
-        self.beta = beta  # weight for blending heuristic policy (0..1)
 
-    # inference
     @torch.no_grad()
     def predict(self, state: Engine.GameState) -> Tuple[Dict[Engine.move, float], float]:
         board = torch.tensor(state.get_current_state(), dtype=torch.float32, device=self.device).unsqueeze(0)
-        logits_cnn, value = self.model(board)
-        probs_cnn = torch.softmax(logits_cnn, dim=1).squeeze(0).cpu().numpy()
+        logits = self.policy(board).squeeze(0)
+        p_full = torch.softmax(logits, dim=0).cpu().numpy()
+        v = float(self.value(board).item())
 
         legal_moves = state.get_all_valid_moves()
         if not legal_moves:
-            return {}, 0.0
-
-        # Heuristic prior
-        probs_heur = self.hp.predict(state)
-
+            return {}, v
         move_probs: Dict[Engine.move, float] = {}
         total = 0.0
         for mv in legal_moves:
-            p_cnn  = probs_cnn[move_to_index(mv)]
-            p_heur = probs_heur.get(mv, 0.0)
-            p = (1 - self.beta) * p_cnn + self.beta * p_heur
+            p = p_full[move_to_index(mv)]
             move_probs[mv] = p
             total += p
         if total == 0:
             move_probs = {m: 1/len(legal_moves) for m in legal_moves}
         else:
             move_probs = {m: p/total for m, p in move_probs.items()}
-        return move_probs, float(value.item())
+        return move_probs, v
 
-    # training 
-    def train(self, samples: List[Tuple[np.ndarray, Dict[Engine.move, float], int]],
-              epochs: int = 5, batch_size: int = 32):
-        if not samples:
+    # ————————————————— joint training
+    def train(self, batch: List[Tuple[np.ndarray, Dict[Engine.move, float], int]], epochs=1, batch_sz=64):
+        if not batch:
             return
-        X , P , V = [], [], []
-        for board, pi, outcome in samples:
+        X, P, V = [], [], []
+        for board, pi, outcome in batch:
             X.append(torch.tensor(board, dtype=torch.float32))
             vec = np.zeros(NUM_MOVES, dtype=np.float32)
             for mv, p in pi.items():
@@ -189,130 +138,109 @@ class NeuraNet:
         V = torch.tensor(V, dtype=torch.float32).to(self.device)
 
         for _ in range(epochs):
-            perm = torch.randperm(len(samples), device=self.device)
+            perm = torch.randperm(len(batch), device=self.device)
             X, P, V = X[perm], P[perm], V[perm]
-            for i in range(0, len(samples), batch_size):
-                xb, pb, vb = X[i:i+batch_size], P[i:i+batch_size], V[i:i+batch_size]
+            for i in range(0, len(batch), batch_sz):
+                xb, pb, vb = X[i:i+batch_sz], P[i:i+batch_sz], V[i:i+batch_sz]
                 self.opt.zero_grad()
-                logits, v_pred = self.model(xb)
-                loss_p = self.kl(F.log_softmax(logits, dim=1), pb)
-                loss_v = self.mse(v_pred, vb)
+                pol_logits = self.policy(xb)
+                val_pred   = self.value(xb)
+                loss_p = self.kl(F.log_softmax(pol_logits, dim=1), pb)
+                loss_v = self.mse(val_pred, vb)
                 (loss_p + loss_v).backward()
                 self.opt.step()
 
-    # persistence 
-    def save_model(self, path: str):
-        torch.save(self.model.state_dict(), path)
+    # ————————————————— persistence
+    def save(self, path_root="dualnet"):
+        torch.save(self.policy.state_dict(), f"{path_root}_policy.pth")
+        torch.save(self.value.state_dict(),  f"{path_root}_value.pth")
 
-    def load_model(self, path: str):
-        self.model.load_state_dict(torch.load(path, map_location=self.device))
-        self.model.eval()
+    def load(self, path_root="dualnet"):
+        self.policy.load_state_dict(torch.load(f"{path_root}_policy.pth", map_location=self.device))
+        self.value.load_state_dict(torch.load(f"{path_root}_value.pth",  map_location=self.device))
+        self.policy.eval(); self.value.eval()
 
 # ────────────────────────────────────────────────────────────────────────────────
+#   MCTS (unchanged API, now uses DualNet)
+# ────────────────────────────────────────────────────────────────────────────────
 class MCTSNode:
-    __slots__ = ("state", "parent", "children", "visit_count", "total_value", "prior", "move")
-    def __init__(self, state: Engine.GameState, parent: Optional['MCTSNode'] = None,
-                 prior: float = 0.0, move: Optional[Engine.move] = None):
-        self.state = state
-        self.parent = parent
-        self.children: Dict[Engine.move, 'MCTSNode'] = {}
-        self.visit_count = 0
-        self.total_value = 0.0
-        self.prior = prior
-        self.move = move
+    __slots__ = ("state","parent","children","visit_count","total_value","prior","move")
+    def __init__(self, state: Engine.GameState, parent: Optional['MCTSNode']=None,
+                 prior=0.0, move: Optional[Engine.move]=None):
+        self.state = state; self.parent = parent; self.prior = prior; self.move = move
+        self.children: Dict[Engine.move,'MCTSNode'] = {}
+        self.visit_count = 0; self.total_value = 0.0
     def q(self):
         return self.total_value / self.visit_count if self.visit_count else 0.0
     def is_leaf(self):
         return not self.children
 
 class MCTS:
-    def __init__(self, nn: NeuraNet, simulations: int = 200, c_puct: float = 1.4):
-        self.nn = nn
-        self.N = simulations
-        self.c = c_puct
-
-    def search(self, root_state: Engine.GameState) -> Dict[Engine.move, float]:
+    def __init__(self, net: DualNet, sims=200, c_puct=1.4):
+        self.net, self.N, self.c = net, sims, c_puct
+    def search(self, root_state: Engine.GameState) -> Dict[Engine.move,float]:
         root = MCTSNode(root_state)
-        # first expansion uses blended priors from nn.predict
-        priors, _ = self.nn.predict(root_state)
-        for mv, p in priors.items():
-            root.children[mv] = MCTSNode(self._next_state(root_state, mv), parent=root, prior=p, move=mv)
-
+        priors, _ = self.net.predict(root_state)
+        for mv,p in priors.items():
+            root.children[mv] = MCTSNode(self._next(root_state,mv), parent=root, prior=p, move=mv)
         for _ in range(self.N):
             leaf = self._select(root)
-            value = self._expand_and_eval(leaf)
+            value = self._expand_eval(leaf)
             self._backprop(leaf, value)
-
         visits = np.array([ch.visit_count for ch in root.children.values()], dtype=np.float32)
-        if visits.sum() == 0:
-            return {}
-        probs = visits / visits.sum()
+        if visits.sum()==0: return {}
+        probs = visits/visits.sum()
         return dict(zip(root.children.keys(), probs))
-
-    def _select(self, node: MCTSNode) -> MCTSNode:
-        while not node.is_leaf():
-            best, best_score = None, -1e9
-            sqrt_visits = np.sqrt(node.visit_count)
-            for ch in node.children.values():
-                u = self.c * ch.prior * sqrt_visits / (1 + ch.visit_count)
-                score = ch.q() + u
-                if score > best_score:
-                    best, best_score = ch, score
-            node = best
-        return node
-
-    def _expand_and_eval(self, node: MCTSNode) -> float:
-        term = self._terminal_value(node.state)
-        if term is not None:
-            return term
-        priors, value = self.nn.predict(node.state)
-        for mv, p in priors.items():
-            node.children[mv] = MCTSNode(self._next_state(node.state, mv), parent=node, prior=p, move=mv)
-        return value
-
-    def _backprop(self, node: MCTSNode, value: float):
+    def _select(self,n):
+        while not n.is_leaf():
+            best, best_s = None, -1e9; sqrt_p = np.sqrt(n.visit_count)
+            for ch in n.children.values():
+                u = self.c*ch.prior*sqrt_p/(1+ch.visit_count); s = ch.q()+u
+                if s>best_s: best,best_s=ch,s
+            n = best
+        return n
+    def _expand_eval(self,node):
+        t = self._term(node.state)
+        if t is not None: return t
+        priors,val = self.net.predict(node.state)
+        for mv,p in priors.items():
+            node.children[mv] = MCTSNode(self._next(node.state,mv), parent=node, prior=p, move=mv)
+        return val
+    def _backprop(self,node,val):
         while node:
-            node.visit_count += 1
-            node.total_value += value
-            value = -value
-            node = node.parent
-
+            node.visit_count+=1; node.total_value+=val; val=-val; node=node.parent
     @staticmethod
-    def _next_state(state: Engine.GameState, mv: Engine.move):
-        nxt = copy.deepcopy(state)
-        nxt.make_move(mv)
-        return nxt
-
+    def _next(state,mv):
+        s = copy.deepcopy(state); s.make_move(mv); return s
     @staticmethod
-    def _terminal_value(state: Engine.GameState):
-        if state.check_mate:
-            return 1 if not state.white_to_move else -1
-        if state.stale_mate:
-            return 0
+    def _term(state):
+        if state.check_mate: return 1 if not state.white_to_move else -1
+        if state.stale_mate: return 0
         return None
 
 # ────────────────────────────────────────────────────────────────────────────────
+#   Self‑play generator
+# ────────────────────────────────────────────────────────────────────────────────
 
-def self_play(nn: NeuraNet, sims: int = 300) -> List[Tuple[np.ndarray, Dict[Engine.move, float], int]]:
-    game = Engine.GameState()
-    mcts = MCTS(nn, simulations=sims)
-    history = []
-    while not (game.check_mate or game.stale_mate):
-        probs = mcts.search(game)
-        if not probs:
-            break
-        history.append((game.get_current_state(), probs, None))
-        mv = max(probs.items(), key=lambda kv: kv[1])[0]  # pick best move (no randomness)
-        game.make_move(mv)
-    outcome = 0
-    if game.check_mate:
-        outcome = 1 if not game.white_to_move else -1
-    return [(b, p, outcome) for (b, p, _) in history]
+def self_play(net: DualNet, sims=300) -> List[Tuple[np.ndarray, Dict[Engine.move,float], int]]:
+    gs=Engine.GameState(); tree=MCTS(net,sims)
+    hist=[]
+    while not (gs.check_mate or gs.stale_mate):
+        pi = tree.search(gs)
+        if not pi: break
+        hist.append((gs.get_current_state(), pi, None))
+        mv = max(pi,itemgetter(1))[0]
+        gs.make_move(mv)
+    z = 0
+    if gs.check_mate: z = 1 if not gs.white_to_move else -1
+    return [(b,p,z) for (b,p,_) in hist]
 
 # ────────────────────────────────────────────────────────────────────────────────
+#   Quick smoke‑test
+# ────────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    net = NeuraNet()
-    positions = self_play(net, sims=60)
-    print(f"Generated {len(positions)} positions → training 1 epoch…")
-    net.train(positions, epochs=1)
-    net.save_model("chess_model.pth")
+    dual = DualNet()
+    data = self_play(dual, sims=60)
+    print("Positions:", len(data))
+    dual.train(data, epochs=1)
+    dual.save()
