@@ -235,9 +235,6 @@ def self_play(net: DualNet, sims=300) -> List[Tuple[np.ndarray, Dict[Engine.move
     if gs.check_mate: z = 1 if not gs.white_to_move else -1
     return [(b,p,z) for (b,p,_) in hist]
 
-# ────────────────────────────────────────────────────────────────────────────────
-#   Quick smoke‑test
-# ────────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     dual = DualNet()
     data = self_play(dual, sims=60)

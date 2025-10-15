@@ -34,8 +34,8 @@ def main():
     running = True
     sq_selected = () #keep track of the last square selected, will be a tuple and have x and y coordinates 
     player_clicks = [] # two tuples, keeps track of the 2 clicks 
-    playerOne = False #True if human white
-    playerTwo = False #False if AI black 
+    playerOne = True #True if human white
+    playerTwo = True #False if AI black 
     game_over = False
     while running:
         humanTurn = (gs.white_to_move and playerOne) or (not gs.white_to_move and playerTwo)
